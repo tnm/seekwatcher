@@ -1,0 +1,1412 @@
+#!/usr/bin/env python
+#
+# Copyright (C) 2007 Oracle.  All rights reserved.
+#
+# To use seekwatcher, you need to download matplotlib, and have the numpy
+# python lib installed on your box (this is the default w/many distro
+# matplotlib packages).
+#
+# There are two basic modes for seekwatcher.  The first is to take
+# an existing blktrace file and create a graph.  In this mode the two
+# most important options are:
+#
+# -t (name of the trace file)
+# -o (name of the output png)
+#
+#
+# Example:
+#
+# blktrace -o read_trace -d /dev/sda &
+#
+# run your test
+# kill blktrace
+#
+# seekwatcher -t read_trace -o trace.png
+#
+# Seekwatcher can also start blktrace for you, run a command, kill blktrace
+# off and generate the plot.  -t and -o are still used, but you also send
+# in the program to run and the device to trace.  The trace file is kept,
+# so you can plot it again later with different args.
+#
+# Example:
+#
+# seekwatcher -t read_trace -o trace.png -p "dd if=/dev/sda of=/dev/zero" \
+#       -d /dev/sda
+#
+# -z allows you to change the window used to zoom in on the most common
+# data on the y axis.  Use min:max as numbers in MB where you want to 
+# zoom. -z 0:0 forces no zooming at all.  The default tries to find the
+# most common area of the disk hit and show only that.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License v2 as published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public
+# License along with this program; if not, write to the
+# Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+# Boston, MA 021110-1307, USA.
+#
+import sys, os, signal, time, commands, tempfile, signal
+from optparse import OptionParser
+from seekwatcher import rundata
+
+blktrace_only = False
+tags = { "": 0 }
+
+try:
+    from matplotlib import rcParams
+    from matplotlib.font_manager import fontManager, FontProperties
+
+    import numpy
+except:
+    sys.stderr.write("matplotlib not found, using blktrace only mode\n")
+    blktrace_only = True
+
+class AnnoteFinder:
+  """
+  callback for matplotlib to display an annotation when points are clicked on.  The
+  point which is closest to the click and within xtol and ytol is identified.
+    
+  Register this function like this:
+    
+  scatter(xdata, ydata)
+  af = AnnoteFinder(xdata, ydata, annotes)
+  connect('button_press_event', af)
+  """
+
+  __clickX=0
+  __clickY=0
+  def __init__(self, axis=None):
+    if axis is None:
+      self.axis = gca()
+    else:
+      self.axis= axis
+    self.drawnAnnotations = {}
+    self.links = []
+    
+  def clear(self):
+    for k in self.drawnAnnotations.keys():
+        self.drawnAnnotations[k].set_visible(False)
+
+  def __call__(self, event):
+    if event.inaxes:
+      if event.button != 1:
+        self.clear()
+        draw()
+        return
+      if event.name == 'button_press_event':
+          self.__clickX = event.xdata
+          self.__clickY = event.ydata
+      elif event.name == 'button_release_event':
+          if (self.axis is None) or (self.axis==event.inaxes):
+              if event.xdata == self.__clickX and event.ydata == self.__clickY:
+                  self.drawAnnote(event.inaxes, self.__clickX, self.__clickY)
+    
+  def drawAnnote(self, axis, x, y):
+    """
+    Draw the annotation on the plot
+    """
+    if self.drawnAnnotations.has_key((x,y)):
+      markers = self.drawnAnnotations[(x,y)]
+      markers.set_visible(not markers.get_visible())
+      draw()
+    else:
+      t = axis.text(x,y, "(%3.2f, %3.2f)"%(x,y), bbox=dict(facecolor='red',
+                    alpha=0.8))
+      self.drawnAnnotations[(x,y)] = t
+      draw()
+
+def loaddata(fh, rundata, delimiter=None):
+
+    io_plot = should_graph(graphs, 'io')
+
+    rundata.load_data(fh, delimiter, io_plot, devices_sector_max,
+            tags, options)
+
+def data_movie(run):
+    def add_frame(prev, ins, max):
+        if len(prev) > max:
+            del prev[0]
+        prev.append(ins)
+
+    def graphit(a, prev,):
+        def plotone(a, x, y, color):
+            a.plot(x, y, 's', color=color, mfc=color,
+                   mec=color, markersize=options.movie_cell_size)
+            a.hold(True)
+        alpha = 0.1
+        a.hold(False)
+
+        for x in xrange(len(prev)):
+            readx, ready, writex, writey = prev[x]
+            if x == len(prev) - 1:
+                alpha = 1.0
+
+            if readx:
+                color = bluemap(alpha)
+                plotone(a, readx, ready, color)
+            if writex:
+                color = greenmap(alpha)
+                plotone(a, writex, writey, color)
+            alpha += 0.1
+
+
+    data = run.data
+    if len(devices_sector_max) > 1:
+        data = sort_by_time(data)
+    times = data[:,7]
+    
+    options.movie_cell_size = float(options.movie_cell_size)
+    num_cells = 600 / options.movie_cell_size
+
+    total_cells = num_cells * num_cells
+    sector_range = yzoommax - yzoommin
+    sectors_per_cell = sector_range / total_cells
+    total_secs = xmax - xmin
+    movie_length = int(options.movie_length)
+    movie_fps = int(options.movie_frames)
+    total_frames = movie_length * movie_fps
+    secs_per_frame = total_secs / total_frames
+    print "total frames is %d secs per frame = %.2f\n" % (total_frames,
+                                                          secs_per_frame)
+    start_second = xmin
+
+    figindex = 0
+
+    png_dir = tempfile.mkdtemp(dir=os.path.dirname(options.output))
+    fname, fname_ext = os.path.splitext(options.output)
+    fname = os.path.join(png_dir, fname);
+
+    i = 0
+    prev = []
+    f = figure(figsize=(8,6))
+    a = axes([ 0.10, 0.29, .85, .68 ])
+    tput_ax = axes([ 0.10, 0.19, .85, .09 ])
+    seek_ax = axes([ 0.10, 0.07, .85, .09 ])
+
+    plot_seek_count(seek_ax, run, [0,0,0,0], '-', None)
+    ticks = seek_ax.get_yticks()
+    ticks = list(arange(0, ticks[-1] + ticks[-1]/3, ticks[-1]/3))
+    seek_ax.set_yticks(ticks)
+    seek_ax.set_yticklabels( [ str(int(x)) for x in ticks ], fontsize='x-small')
+    seek_ax.set_ylabel('Seeks / sec', fontsize='x-small')
+    seek_ax.set_xlabel('Time (seconds)', fontsize='x-small')
+    seek_ax.grid(True)
+
+    plot_throughput(tput_ax, run, [0,0,0,0], '-', None)
+
+    # cut down the number of yticks to something more reasonable
+    ticks = tput_ax.get_yticks()
+    ticks = list(arange(0, ticks[-1] + ticks[-1]/3, ticks[-1]/3))
+    tput_ax.set_yticks(ticks)
+    tput_ax.set_xticks([])
+    tput_ax.grid(True)
+
+    if ticks[-1] - ticks[0] < 3:
+        tput_ax.set_yticklabels( [ "%.1f" % x for x in ticks ],
+                                fontsize='x-small')
+    else:
+        tput_ax.set_yticklabels( [ "%d" % x for x in ticks ],
+                                fontsize='x-small')
+
+    tput_ax.set_ylabel('MB/s', fontsize='x-small')
+
+    a.set_xticklabels([])
+    a.set_yticklabels([])
+    a.set_xlim(0, num_cells)
+    a.set_ylim(0, num_cells)
+    a.hold(False)
+    datalen = len(data)
+    bluemap = get_cmap("Blues")
+    greenmap = get_cmap("Greens")
+
+    moviedata = rundata.moviedata(data, xmax, yzoommin,
+            yzoommax, sectors_per_cell, num_cells)
+
+    while i < total_frames and moviedata.datai < datalen:
+        start = start_second + i * secs_per_frame
+        i += 1
+        end = start + secs_per_frame
+        if moviedata.datai >= datalen or data[moviedata.datai][7] > xmax:
+            break
+        write_xvals = []
+        write_yvals = []
+        read_xvals = []
+        read_yvals = []
+
+        moviedata.make_frame(start, end, read_xvals, read_yvals, write_xvals, write_yvals, prev)
+
+        if not read_xvals and not write_xvals:
+            continue
+
+        graphit(a, prev)
+
+        a.set_xticklabels([])
+        a.set_yticklabels([])
+        a.set_xlim(0, num_cells)
+        a.set_ylim(0, num_cells)
+        line = seek_ax.axvline(x=end, color='k')
+        line2 = tput_ax.axvline(x=end, color='k')
+        tput_ax.set_xlim(xmin, xmax)
+        seek_ax.set_xlim(xmin, xmax)
+
+        print "start %.2f secs end %.2f secs frame %d" % (start, end, figindex)
+        f.savefig("%s-%.6d.%s" % (fname, figindex, "png"), dpi=options.dpi)
+        line.set_linestyle('None')
+        line2.set_linestyle('None')
+        figindex += 1
+    a.hold(True)
+
+    if mencoder == "png2theora":
+        os.system("png2theora -o %s %s" % (movie_name, fname) + '-%06d.png')
+    else:
+        os.system("mencoder mf://%s*.png -mf type=png:fps=%d -of mpeg -ovc lavc -lavcopts vcodec=mpeg2video:vbitrate=%s -oac copy -o %s" % (fname, movie_fps, options.movie_vbitrate, movie_name))
+
+    for root, dirs, files in os.walk(png_dir):
+        for name in files:
+            os.remove(os.path.join(root, name))
+    os.rmdir(png_dir)
+
+def save_color(label, rw, color, legend_colors):
+    if not label:
+        return
+    if rw == None:
+        rw = 0
+    legend_colors.setdefault((label, rw), color)
+
+def pick_color(label, rw, legend_colors):
+    if rw == None:
+        this_rw = 0
+    else:
+        this_rw = rw
+    val = legend_colors.get((label, this_rw), None)
+    if val:
+        return val
+    if rw == None:
+        val = legend_colors.get((label, 1), None)
+        if val:
+            return val
+
+    if plot_colors:
+        val = plot_colors.pop()
+    return val
+
+def plot_data(ax, data, style, label, legend_colors, alpha=1):
+    def reduce_plot():
+        reduce = {}
+        skipped = 0
+        last_dev = {}
+        for i in xrange(len(times)):
+            dev = data[i][8]
+            sector = sectors[i]
+            io_size = data[i][5] / 512
+            last, last_size = last_dev.get(dev, (None, None))
+            last_dev[dev] = (sector, io_size)
+            if last and options.only_io_graph_seeks:
+                diff = abs((last + last_size) - sector)
+                if diff < 128:
+                    continue
+            x = floor(times[i] / x_per_cell)
+            y = floor(sector / y_per_cell)
+            if x in reduce and y in reduce[x]:
+                skipped += 1
+                continue
+            y += 1
+            h = reduce.setdefault(x, {})
+            h[y] = 1
+            yield rbs[i]
+            yield x * x_per_cell
+            yield y * y_per_cell
+            yield tg[i]
+
+    # if we're the only graph, make more cells
+    if len(graphs) == 1:
+        more_detail = 1024
+    elif len(graphs) == 2:
+        more_detail = 512
+    else:
+        more_detail = 1
+
+    xcells = 325.0 * options.io_graph_cell_multi * more_detail
+    x_per_cell = (xmax - xmin) / xcells
+    ycells = 80.0 * options.io_graph_cell_multi * more_detail
+    y_per_cell = (yzoommax - yzoommin) / ycells
+
+    rbs = data[:,1]
+    times = data[:,7]
+    sectors = data[:,4]
+    tg = data[:,9]
+    t = numpy.fromiter(reduce_plot(), dtype=float)
+    t.shape = (len(t)/4, 4)
+    lines = []
+
+    kwargs = { 'mew' : 0,
+            'ms' : options.io_graph_marker_size,
+            'alpha':alpha}
+
+    for tag in tags:
+        # most of the time we have only one tag.
+        # don't do the expensive where in that case
+        if len(tags) > 1:
+            at = t[numpy.where(t[:,3] == tags[tag])]
+        else:
+            at = t
+        
+        if len(at) == 0:
+            continue
+        if not options.writes_only:
+            atr = at[numpy.where(at[:,0] == 0)]
+            if len(atr > 0):
+                this_label = tag + " Reads " + label
+                kwargs['label'] = this_label
+                color = pick_color(this_label, 0, legend_colors)
+                if color:
+                    kwargs['color'] = color
+                lines.extend(ax.plot(atr[:,1], atr[:,2], style, **kwargs))
+                save_color(this_label, 0, lines[-1].get_color(), legend_colors)
+        if not options.reads_only:
+            atr = at[numpy.where(at[:,0] == 1)]
+            if len(atr > 0):
+                this_label = tag + " Writes " + label
+                kwargs['label'] = this_label
+                color = pick_color(this_label, 1, legend_colors)
+                if color:
+                    kwargs['color'] = color
+                lines.extend(ax.plot(atr[:,1], atr[:,2], style, **kwargs))
+                save_color(this_label, 1, lines[-1].get_color(), legend_colors)
+    return lines
+
+
+def add_roll(roll, max, num):
+    if len(roll) == max:
+        del roll[0]
+    roll.append(num)
+    total = 0.0
+    for x in roll:
+        total += x
+    return total / len(roll)
+
+def plot_iops(ax, run, stats, style, label, alpha=1):
+
+    times = []
+    counts = []
+    roll = []
+    t = floor(xmin)
+    total = 0
+    last_time = min(xmax, run.last_time)
+    while t <= floor(last_time):
+        val = run.iops.get(t, 0)
+        total += val
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg)
+        times.append(t)
+        t += 1
+
+    sec = times[-1]
+    scale = last_time - sec
+    data = run.last_iops
+    if scale > 0 and scale < 1:
+        val = counts[-1] + 1
+        val = val / scale
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg)
+        times.append(ceil(last_time))
+
+    secs = min(xmax - xmin, run.last_time - xmin)
+    stats[2] = round(total / secs, 2)
+
+    kwargs = { "label" : label, "alpha" : alpha }
+    if label:
+        color = pick_color(label, None, legend_colors)
+        if color:
+            kwargs['color'] = color
+
+    lines = ax.plot(times, counts, style, **kwargs)
+    if lines:
+        save_color(label, 0, lines[-1].get_color(), legend_colors)
+    return lines
+
+def plot_throughput(ax, run, stats, style, label, alpha=1):
+
+    times = []
+    counts = []
+    roll = []
+    t = floor(xmin)
+    total = 0
+    last_time = min(xmax, run.last_time)
+    while t <= floor(last_time):
+        val = run.tput.get(t, 0)
+        total += val
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg / (1024 * 1024))
+        times.append(t)
+        t += 1
+
+    sec = times[-1]
+    scale = last_time - sec
+    data = run.last_tput
+    if scale > 0 and scale < 1:
+        val = counts[-1] + run.last_tput[5]
+        val = val / scale
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg / (1024 * 1024))
+        times.append(ceil(last_time))
+
+    total /= (1024 * 1024)
+    secs = min(xmax - xmin, run.last_time - xmin)
+    stats[1] = round(total / secs, 2)
+
+    kwargs = { "label" : label, "alpha" : alpha }
+    if label:
+        color = pick_color(label, None, legend_colors)
+        if color:
+            kwargs['color'] = color
+
+    lines = ax.plot(times, counts, style, **kwargs)
+    if lines:
+        save_color(label, 0, lines[-1].get_color(), legend_colors)
+    return lines
+
+
+def plot_seek_count(ax, run, stats, style, label, alpha=1):
+
+    times = []
+    counts = []
+    roll = []
+    t = floor(xmin)
+    total = 0
+    max_time = run.last_time
+    last_time = min(xmax, max_time)
+    while t <= floor(last_time):
+        val = run.seeks.get(t, 0)
+        total += val
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg)
+        times.append(t)
+        t += 1
+
+    sec = times[-1]
+    scale = last_time - sec
+    data = run.last_seek
+    if scale > 0 and scale < 1:
+        dev = run.last_seek[8]
+        last = run.seek_hist.get(dev, 0)
+        val = counts[-1]
+        if last:
+            sector = run.last_seek[4]
+            diff = abs(last - sector)
+            if diff > 128:
+                val += 1
+                total += 1
+        val = val / scale
+        avg = add_roll(roll, options.rolling_avg, val)
+        counts.append(avg)
+        times.append(ceil(last_time))
+
+    secs = min(xmax - xmin, run.last_time - xmin)
+    stats[0] = round(total / secs, 2)
+    kwargs = { "label" : label, "alpha" : alpha }
+    if label:
+        color = pick_color(label, None, legend_colors)
+        if color:
+            kwargs['color'] = color
+
+    lines = ax.plot(times, counts, style, **kwargs)
+    if lines:
+        save_color(label, 0, lines[-1].get_color(), legend_colors)
+    return lines
+
+def run_one_blktrace(trace, device):
+    #args = [ "blktrace", "-d", device,  "-o", trace, "-b", "16384" ]
+    args = [ "blktrace", "-d", device,  "-o", trace, "-D",
+            options.blktrace_destination ]
+    if not options.full_trace:
+        args += [ "-a", "queue", "-a", "complete", "-a", "issue" ]
+    print " ".join(args)
+    return os.spawnlp(os.P_NOWAIT, *args)
+
+def run_blktrace(trace, devices):
+    pids = []
+    for x in devices:
+        tmp = x.replace('/', '.')
+        if len(devices) > 1:
+            this_trace = trace + "." + tmp
+        else:
+            this_trace = trace
+        pids.append(run_one_blktrace(this_trace, x))
+    return pids
+
+blktrace_pids = []
+def run_prog(program, trace, devices):
+    global blktrace_pids
+    def killblktracers(signum, frame):
+        global blktrace_pids
+        cpy = blktrace_pids
+        blktrace_pids = []
+        for x in cpy:
+            os.kill(x, signal.SIGTERM)
+            pid, err = os.wait()
+            if err:
+                sys.stderr.write("exit due to blktrace failure %d\n" % err)
+                sys.exit(1)
+
+    blktrace_pids = run_blktrace(trace, devices)
+
+    # force some IO, blktrace does timestamps from the first IO
+    if len(devices) > 1:
+        for x in devices:
+            try:
+                os.system("dd if=%s of=/dev/zero bs=16k count=1 iflag=direct > /dev/null 2>&1" % x)
+            except:
+                print "O_DIRECT read from %s failed trying buffered" % x
+                b = file(x).read(1024 * 1024)
+
+    signal.signal(signal.SIGTERM, killblktracers)
+    signal.signal(signal.SIGINT, killblktracers)
+    sys.stderr.write("running :%s:\n" % program)
+    os.system(program)
+    sys.stderr.write("done running %s\n" % program)
+    killblktracers(None, None)
+    sys.stderr.write("blktrace done\n")
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+def run_blkparse(trace):
+    tracefiles = []
+    seen = {}
+    trace_dir = options.blktrace_destination
+    full_trace_name = os.path.join(trace_dir, trace)
+
+    # use the exact trace name if it is a match
+    if not os.path.exists(full_trace_name + ".blktrace.0"):
+        dirname = os.path.dirname(full_trace_name) or "."
+        files = os.listdir(dirname)
+        joinname = os.path.dirname(full_trace_name) or ""
+        for x in files:
+            x = os.path.join(joinname, x)
+            if x.startswith(full_trace_name) and ".blktrace." in x:
+                i = x.rindex('.blktrace.')
+                cur = x[0:i]
+                if cur not in seen:
+                    tracefiles.append(x[0:i])
+                    seen[cur] = 1
+    else:
+        tracefiles.append(trace)
+
+    rd = rundata.rundata()
+    if options.tag_process:
+        proc_tags = ' %p %C'
+    else:
+        proc_tags = ""
+
+    for x in tracefiles:
+        print "using tracefile %s" % os.path.join(trace_dir, x)
+        fh = tempfile.NamedTemporaryFile(dir=".")
+        os.system('blkparse -q -D ' + trace_dir + ' -i ' + x +
+                ' -d ' + fh.name + ' -O >& /dev/null')
+        loaddata(fh, rd)
+    return rd
+
+def getlabel(i):
+    if i < len(options.label):
+        return options.label[i]
+    return ""
+
+def line_picker(line, mouseevent):
+    if mouseevent.xdata is None: return False, dict()
+    print "%d %d\n", mouseevent.xdata, mouseevent.ydata
+    return False, dict()
+
+def running_config():
+	"""
+	Return path of config file of the currently running kernel
+	"""
+	version = commands.getoutput('uname -r')
+	for config in ('/proc/config.gz', \
+                       '/boot/config-%s' % version,
+                       '/lib/modules/%s/build/.config' % version):
+		if os.path.isfile(config):
+			return config
+	return None
+
+
+def check_for_kernel_feature(feature):
+	config = running_config()
+
+	if not config:
+		sys.stderr.write("Can't find kernel config file")
+
+	if config.endswith('.gz'):
+		grep = 'zgrep'
+	else:
+		grep = 'grep'
+	grep += ' ^CONFIG_%s= %s' % (feature, config)
+
+	if not commands.getoutput(grep):
+		sys.stderr.write("Kernel doesn't have a %s feature\n" % (feature))
+		sys.exit(1)
+
+def check_for_debugfs():
+    tmp = commands.getoutput('mount | grep /sys/kernel/debug')
+    tmp = len(tmp)
+    if tmp == 0:
+        sys.stderr.write("debugfs not mounted (/sys/kernel/debug)\n")
+        sys.exit(1)
+
+def check_for_mencoder(encoder_prog=all):
+    # check for either supported media encoder when no arguments specified
+    if encoder_prog == all:
+        r1 = check_for_mencoder("png2theora")
+        if r1:
+            return True
+        return check_for_mencoder("mencoder")
+
+    dirs = os.getenv('PATH', os.path.defpath).split(os.path.pathsep)
+    for dir in dirs:
+        fname = os.path.join(dir, encoder_prog)
+        if os.path.isfile(fname):
+            return True
+    return False
+
+def translate_sector(dev, sector):
+    return device_translate[dev] + sector;
+
+
+# find either the highest or lowest value in stats
+# for a given column and change that cell in the table
+# read.  To find the   highest use find_max = True, lowest
+# use find_max = False
+def highlight_row(stats, cells, col, num_rows, find_max):
+
+    if num_rows == 1:
+        return
+
+    val = 0
+    max_val = 0
+    max = []
+    for row in xrange(0, num_rows):
+        x = stats[row][col]
+        if find_max:
+            if not max or x > max_val:
+                max_val = x
+                max = []
+        else:
+            if not max or x < max_val:
+                max_val = x
+                max = []
+        if x == max_val:
+            max.append(row)
+    for x in max:
+        cell = cells[(x + 1, col)]
+        cell.get_text().set_color('red')
+
+# Fixes up font sizes and does highlights for the
+# best value in each column
+#
+def format_table_cells(stats, cells, num_rows, col_high):
+    for key,cell in cells.items():
+        pt = cell.get_fontsize()
+        if (pt > 7):
+            cell.set_fontsize(pt - 1)
+
+    for i, x in enumerate(col_high):
+        highlight_row(stats, cells, i, num_rows, x)
+
+# if a given label should be graphed, this returns the subplot number.
+def should_graph(graphs, label):
+    cols = options.columns
+    rows = (len(graphs) + cols - 1) / cols
+    col_last_row = len(graphs) % cols
+    bottom_row = rows
+
+    for x in graphs:
+        if label != x[1]:
+            continue
+
+        this_row = (x[0] - 1) / cols + 1
+        if this_row == bottom_row and col_last_row == 1:
+            return (rows, col_last_row, rows + x[0] % col_last_row)
+        # rows, columns, plot number
+        return rows, cols, x[0]
+    return None
+
+def sort_by_time(data):
+    def sort_iter(sorted):
+        for x in sorted:
+            for field in data[x]:
+                yield field
+
+    times = data[:,7]
+    sorted = times.argsort()
+    X = numpy.fromiter(sort_iter(sorted), dtype=float)
+    lines = len(X) / 10
+    X.shape = (lines, 10)
+    return X
+
+def parse_legend_pos(str):
+    if not str:
+        return None
+    words = str.split(',')
+    return float(words[0]), float(words[1])
+
+def parse_plot_adjust(str):
+    words = [ "right=0.79", "hspace=0.8" ]
+    if options.columns > 1:
+        words.append("wspace=0.6")
+        words.append("hspace=1")
+
+    if str:
+        words += str.split(',')
+    d = {}
+    for x in words:
+        key, value = x.split('=')
+        value = float(value)
+        d[key] = value
+    return d
+
+def title_axis(a, str):
+    title_y = 1.03
+    if (force_legend and force_legend[1] >= 1 and
+        force_legend[0] < 1 and force_legend[0] >= 0):
+        title_y = force_legend[1] + 0.2
+
+    a.text(0.5, title_y, str, fontsize="large",
+            horizontalalignment='center', transform = a.transAxes)
+
+usage = "usage: %prog [options]"
+parser = OptionParser(usage=usage)
+parser.add_option("-d", "--device", help="Device for blktrace", default=[],
+                  action="append")
+parser.add_option("-D", "--blktrace-destination",
+        help="Destination for blktrace", default=".")
+parser.add_option("-t", "--trace", help="blktrace file", default=[],
+                  action="append")
+parser.add_option("-p", "--prog", help="exec program", default="")
+parser.add_option("", "--full-trace", help="Don't filter blktrace events",
+                  default=False, action="store_true")
+
+if not blktrace_only:
+    parser.add_option("-a", "--adjust",
+        help="Adjust plot placement: left=0.125,right=0.79,bottom=0.1,top=0.9,wspace=0.2,hspace=0.8",
+        default="")
+    parser.add_option("-c", "--colors", help="List of colors to use in plot",
+            default="")
+    parser.add_option("-C", "--columns", help="Number of columns for subplots",
+            default=1, type="int")
+    parser.add_option("-z", "--zoom", help="Zoom range min:max (in MB)",
+                      default="")
+    parser.add_option("-x", "--xzoom", help="Time range min:max (seconds)",
+                    default="")
+    parser.add_option("-o", "--output", help="output file", default="trace.png")
+    parser.add_option("-l", "--label", help="label", default=[],
+                      action="append")
+    parser.add_option("", "--dpi", help="dpi", default=120, type="float")
+    parser.add_option("", "--io-graph-dots", help="Disk IO dot style",
+                      default='s')
+    parser.add_option("", "--io-graph-marker-size", help="Disk IO dot size",
+                      default=0.7, type="float")
+    parser.add_option("", "--io-graph-cell-multi", help="Multiplier for cells",
+                      default=2, type="float")
+    parser.add_option("-O", "--only-graph",
+         help="Add a single graph to the output (io, tput, seek, iops, stats)",
+         default=[], action="append")
+    parser.add_option("-N", "--no-graph",
+         help="Remove a single graph (io, tput, seek, iops, stats)",
+         default=[], action="append")
+                        
+    parser.add_option("-s", "--only-io-graph-seeks",
+                        help="Only plot seeks on the IO graph",
+                      default=False, action="store_true");
+    parser.add_option("-r", "--rolling-avg",
+                  help="Rolling average for seeks and throughput (in seconds)",
+                  default=None)
+
+    parser.add_option("-i", "--interactive", help="Use matplotlib interactive",
+                      action="store_true", default=False)
+    parser.add_option("", "--backend",
+               help="matplotlib backend (QtAgg, TkAgg, GTKAgg) case sensitive",
+               default="QtAgg")
+    parser.add_option("-T", "--title", help="Graph Title", default="")
+    parser.add_option("-R", "--reads-only", help="Graph only reads",
+                      default=False, action="store_true")
+    parser.add_option("-W", "--writes-only", help="Graph only writes",
+                      default=False, action="store_true")
+    parser.add_option("-F", "--figure-size", help="Figure size (8x6)",
+                      default="8x10")
+    parser.add_option("-P", "--tag-process", help="Tag IO graph by process",
+                      default=False, action="store_true")
+    parser.add_option("-M", "--merge", help="Merge process pids for a process",
+                        default=[], action="append")
+    parser.add_option("", "--legend", help="Legend position 1.01,0.5",
+                        default=None)
+    parser.add_option("", "--legend-columns", help="Legend columns",
+                        default=1, type="int")
+
+    mencoder_found = check_for_mencoder()
+    if mencoder_found:
+        parser.add_option("-m", "--movie", help="Generate an IO movie",
+                          default=False, action="store_true")
+        parser.add_option("", "--movie-frames",
+                          help="Number of frames per second",
+                          default=10)
+        parser.add_option("", "--movie-length", help="Movie length in seconds",
+                          default=30)
+        parser.add_option("", "--movie-cell-size",
+                          help="Size in pixels of the IO cells", default=2)
+        parser.add_option("", "--movie-vbitrate",
+                          help="Mencoder vbitrate option (default 16000)",
+                          default="16000")
+
+(options,args) = parser.parse_args()
+adjust_kwargs = parse_plot_adjust(options.adjust)
+force_legend = parse_legend_pos(options.legend)
+
+if options.colors:
+    plot_colors = options.colors.split(',')
+    # we use pop to pull colors off, so reverse the list
+    plot_colors.reverse()
+else:
+    plot_colors = []
+
+if not blktrace_only:
+    if options.interactive:
+        rcParams['backend'] = options.backend
+        rcParams['interactive'] = 'True'
+    else:
+        rcParams['backend'] = 'Agg'
+        rcParams['interactive'] = 'False'
+    from pylab import *
+
+if not options.trace and not options.file:
+    parser.print_help()
+    sys.exit(1)
+
+# Validate the movie parameters
+if mencoder_found and options.movie:
+    movie_name = options.output
+    # Default to creating an ogg using png2theora.  This can be changed by
+    # specifying an output file name that ends in mpg.
+    if options.output.endswith((".mpg", ".mpeg", ".MPG", ".MPEG")):
+        if not check_for_mencoder("mencoder"):
+            print "mencoder required for encoding mpegs. Try using -o fname.ogg"
+            sys.exit(1)
+        mencoder = "mencoder"
+    elif options.output.endswith((".ogg", ".OGG")):
+        if check_for_mencoder("png2theora"):
+            mencoder = "png2theora"
+        else:
+            # We can't get here unless mencoder is set to either mencoder or
+            # png2theora, so if the encoder isn't the latter...
+            mencoder = "mencoder"
+    elif options.output.endswith((".png")):
+        # This is the path we take if no output filename is specified.
+        movie_name = "trace.ogg"
+        mencoder = "png2theora"
+    else:
+        print "Error: please specify an output file name that ends in " \
+              ".ogg or .mpg"
+	sys.exit(1)
+
+if options.prog:
+    check_for_kernel_feature("DEBUG_FS")
+    check_for_kernel_feature("BLK_DEV_IO_TRACE")
+    check_for_debugfs()
+
+    if not options.trace or not options.device:
+        sys.stderr.write("blktrace output file or device not specified\n")
+        sys.exit(1)
+    run_prog(options.prog, options.trace[0], options.device)
+    if blktrace_only:
+        sys.exit(0)
+
+    if not options.title:
+        options.title = options.prog
+
+graphs = [ [1, 'io'], [2, 'tput'], [3, 'seek'], [4, 'iops'], [5, 'stats'] ]
+
+# fix up our array of which graphs to print
+if options.only_graph:
+    new_graphs = []
+    for x in options.only_graph:
+        for g in graphs:
+            if x == g[1]:
+                new_graphs.append(g)
+    graphs = new_graphs
+
+if options.no_graph:
+    for x in options.no_graph:
+        i = 0
+        while i < len(graphs):
+            if x == graphs[i][1]:
+                del graphs[i]
+                break
+            i += 1
+
+# sorting the array gets the subplot indexes back in the
+# correct order, but they may be too high.  The next loop
+# corrects the actual values
+graphs.sort()
+total = 1
+# now correct the subplot indexes in the array
+for x in graphs:
+    x[0] = total
+    total += 1
+
+if len(graphs) == 0:
+    print "No graphs selected, exiting"
+    sys.exit(1)
+
+# the bottom graph gets the xticks label,
+# but we don't want it to be the stats table
+if graphs[-1][1] == 'stats':
+    if len(graphs) > 1:
+        bottom_graph = graphs[-2][0]
+    else:
+        bottom_graph = 0
+else:
+    bottom_graph = graphs[-1][0]
+
+
+runs = []
+must_sort = True
+devices_sector_max = {}
+device_translate = {}
+
+for x in options.trace:
+    run = run_blkparse(x)
+    runs.append(run)
+
+# if our traces included more than one device,
+# map each device to its own offset starting from zero.
+#
+if len(devices_sector_max) > 1:
+    must_sort = True
+    total = 0
+
+    # the keys are the device major/minor numbers and by sorting them
+    # we make sure the devices are in non-random order in the output
+    keys = devices_sector_max.keys()
+    keys.sort()
+    for x in keys:
+        device_translate[x] = total
+        total += devices_sector_max[x] + 1000000
+
+stats = []
+data = None
+for i in xrange(len(runs)):
+    if not runs[i].last_time:
+        sys.stderr.write("Empty blktrace run found, exiting\n")
+        sys.exit(1)
+
+    runs[i].translate_run(devices_sector_max, device_translate)
+
+    stats.append([0, 0, 0, round(runs[i].last_time, 2)])
+    if data != None:
+        data = numpy.append(data, runs[i].data, axis=0)
+    else:
+        data = runs[i].data
+
+
+# data includes offset numbers from all the runs.  This allows us to scale the
+# whole IO graph.
+
+# try to drop out the least common data points by creating
+# a historgram of the sectors seen.
+sectors = data[:,4]
+sizes = data[:,5]
+ymean = numpy.mean(sectors)
+sectormax = numpy.max(sectors)
+sectormin = numpy.min(sectors)
+
+if not options.zoom or ':' not in options.zoom:
+    def add_range(hist, step, sectormin, start, size):
+        while size > 0:
+            slot = int((start - sectormin) / step)
+            slot_start = step * slot + sectormin
+            if slot >= len(hist) or slot < 0:
+                sys.stderr.write("illegal slot %d start %d step %d\n" %
+                                (slot, start, step))
+                return
+            else:
+                val = hist[slot]
+            this_size = min(size, start - slot_start)
+            this_count = max(this_size / 512, 1)
+            hist[slot] = val + this_count
+            size -= this_size
+            start += this_count
+        
+    hist = [0] * 11
+    step = (sectormax - sectormin) / 10
+    for row in data:
+        start = row[4]
+        size = row[5] / 512
+        add_range(hist, step, sectormin, start, size)
+
+    m = max(hist)
+
+    for x in xrange(len(hist)):
+        if m == hist[x]:
+            maxi = x
+    # hist[maxi] is the most common bucket.  walk toward it from the
+    # min and max values looking for the first buckets that have some
+    # significant portion of the data
+    #
+    yzoommin = maxi * step + sectormin
+    for x in xrange(0, maxi):
+        if hist[x] > hist[maxi] * .05:
+            yzoommin = x * step + sectormin
+            break
+
+    yzoommax = (maxi + 1) * step + sectormin
+    for x in xrange(len(hist) - 1, maxi, -1):
+        if hist[x] > hist[maxi] * .05:
+            yzoommax = (x + 1) * step + sectormin
+            break
+else:
+    words = options.zoom.split(':')
+    yzoommin = max(0, float(words[0]) * 2048)
+    if float(words[1]) == 0:
+        yzoommax = sectormax
+    else:
+        yzoommax = min(sectormax, float(words[1]) * 2048)
+
+sizes = 0
+times = data[:,7]
+xmin = numpy.min(times)
+xmax = numpy.max(times)
+
+if options.rolling_avg == None:
+    options.rolling_avg = max(1, int((xmax - xmin) / 25))
+else:
+    options.rolling_avg = max(1, int(options.rolling_avg))
+
+if options.xzoom:
+    words = [ float(x) for x in options.xzoom.split(':') ]
+    if words[0] != 0:
+        xmin = words[0]
+    if words[1] != 0:
+        xmax = words[1]
+
+sectors = 0
+completed = 0
+times = 0
+legend_colors = {}
+
+for x in stats:
+    if x[3] > xmax:
+        x[3] = xmax
+    x[3] -= xmin
+    x[3] = round(x[3], 2)
+
+if mencoder_found and options.movie:
+    data_movie(runs[0])
+    sys.exit(1)
+
+try:
+    sizes = options.figure_size.split('x')
+except:
+    print "Invalid figure size %s, using 8x10" % options.figure_size
+    sizes = ["8", "6" ]
+
+sizes = [ int(x) for x in sizes ]
+f = figure(figsize=(sizes[0], sizes[1]))
+
+if options.title:
+    options.title += "\n"
+
+total_graphs = len(graphs)
+legend_args = dict(shadow=True, borderpad=0.5, numpoints=2,
+                   ncol=options.legend_columns,
+                   handletextpad = 0.005,
+                   labelspacing = 0.01,
+                   prop=FontProperties(size='x-small'))
+
+legend_args['loc'] = force_legend or (1.01, 0.8)
+
+if (force_legend and force_legend[0] == 0 and (force_legend[1] < 0 or
+    force_legend[1] > 1)):
+    legend_args['mode'] = 'expand'
+
+# Prepare ticks
+# make sure the final second goes on the x axes
+ticks = list(arange(xmin, xmax, xmax/8))
+ticks.append(xmax)
+xticks = ticks
+if xmax - xmin < 8:
+    xticklabels = [ "%.1f" % (x - xmin) for x in ticks ]
+else:
+    xticklabels = [ "%d" % (x - xmin) for x in ticks ]
+
+plot = should_graph(graphs, 'io')
+if plot:
+    a = subplot(*plot)
+    all_lines = []
+    for i in xrange(len(runs)):
+        label = getlabel(i)
+        all_lines += plot_data(a, runs[i].data, options.io_graph_dots, label,
+                                legend_colors)
+
+    af = AnnoteFinder(axis=a)
+    connect('button_press_event', af)
+    connect('button_release_event', af)
+    title_axis(a, options.title + 'Disk IO')
+    a.set_ylabel('Disk offset (MB)')
+    flag = data[:,0]
+    sectors = data[:,4]
+    zoom = (sectors > yzoommin) & (sectors < yzoommax)
+    zoom = data[zoom]
+    sectors = zoom[:,4]
+    yzoommin = numpy.min(sectors)
+    yzommmax = numpy.max(sectors)
+    ticks = list(arange(yzoommin, yzoommax, (yzoommax - yzoommin) / 4))
+    ticks.append(yzoommax)
+    a.set_yticks(ticks)
+    a.set_yticklabels( [ str(int(x/2048)) for x in ticks ] )
+
+    # if more than one device is in this graph, add a line so
+    # we can tell where each device starts and ends.
+    #
+    ll = device_translate.items()
+    if len(ll) > 1:
+        for x in xrange(len(ll)):
+            dev, val = ll[x]
+            dev = round(dev, 2)
+            a.axhline(val, lw=0.1, color='black')
+            a.text(xticks[-1] + .10, val, dev,
+                     fontproperties=FontProperties(size='x-small') )
+        legend_pos = 1.07
+    else:
+        legend_pos = 1.01
+
+    # matplotlib has a markerscale option on the legend, but it
+    # is ignored.  So we explicitly set the marker size before creating
+    # the lenged and then set it back when we're done.
+    #
+    for x in all_lines:
+        x.set_markersize(5)
+
+    data_legend_args = dict(legend_args)
+    data_legend_args['numpoints'] = 1
+
+    if total_graphs == 1:
+        ncol = min(4, len(tags.keys()))
+        # matplotlib throws an error if there are fewer labels than
+        # columns.  So, we loop.
+        loc = force_legend or (-0.1,-0.25)
+        data_legend_args['loc'] = loc
+        while ncol > 1:
+            try:
+                data_legend_args['ncol'] = ncol
+                a.legend(**data_legend_args)
+                break
+            except:
+                if ncol == 1:
+                    raise
+                ncol -= 1
+
+        subplots_adjust(bottom=0.2)
+    else:
+        a.legend(**data_legend_args)
+
+    # our legend is generated, set the marker size correctly again
+    for x in all_lines:
+        x.set_markersize(options.io_graph_marker_size)
+    a.set_ylim(yzoommin, yzoommax)
+
+plot = should_graph(graphs, 'tput')
+if plot:
+    # Throughput goes at the botoom
+    a = subplot(*plot)
+    for i in xrange(len(runs)):
+        label = getlabel(i)
+        plot_throughput(a, runs[i], stats[i], '-', label)
+
+    a.set_xticks(xticks)
+    a.set_xticklabels(xticklabels)
+
+    # cut down the number of yticks to something more reasonable
+    ticks = a.get_yticks()
+    ticks = list(arange(0, ticks[-1] + ticks[-1]/8, ticks[-1]/8))
+    a.set_yticks(ticks)
+
+    if ticks[-1] - ticks[0] < 8:
+        a.set_yticklabels( [ "%.1f" % x for x in ticks ])
+    else:
+        a.set_yticklabels( [ "%d" % x for x in ticks ])
+
+    if plot[2] == 1:
+        title_axis(a, options.title + 'Throughput')
+    else:
+        title_axis(a, 'Throughput')
+    a.set_ylabel('MB/s')
+
+    if options.label:
+        a.legend(**legend_args)
+
+plot = should_graph(graphs, 'iops')
+if plot:
+    a = subplot(*plot)
+    for i in xrange(len(runs)):
+        label = getlabel(i)
+        plot_iops(a, runs[i], stats[i], '-', label)
+
+    a.set_xticks(xticks)
+    a.set_xticklabels(xticklabels)
+
+    # cut down the number of yticks to something more reasonable
+    ticks = a.get_yticks()
+    ticks = list(arange(0, ticks[-1] + ticks[-1]/8, ticks[-1]/8))
+    a.set_yticks(ticks)
+
+    if ticks[-1] - ticks[0] < 8:
+        a.set_yticklabels( [ "%.1f" % x for x in ticks ])
+    else:
+        a.set_yticklabels( [ "%d" % x for x in ticks ])
+
+    if plot[2] == 1:
+        title_axis(a, options.title + 'IOPs')
+    else:
+        title_axis(a, 'IOPs')
+    a.set_ylabel('IO / sec')
+
+    if options.label:
+        a.legend(**legend_args)
+
+plot = should_graph(graphs, 'seek')
+if plot:
+    # next is the seek count graph
+    a = subplot(*plot)
+    for i in xrange(len(runs)):
+        label = getlabel(i)
+        plot_seek_count(a, runs[i], stats[i], '-', label)
+
+    # cut down the number of yticks to something more reasonable
+    ticks = a.get_yticks()
+    ticks = list(arange(0, ticks[-1] + ticks[-1]/6, ticks[-1]/4))
+    a.set_yticks(ticks)
+    if (sum(ticks) / len(ticks)) < 4:
+        a.set_yticklabels( [ "%.2f" % x for x in ticks ])
+    else:
+        a.set_yticklabels( [ str(int(x)) for x in ticks ])
+
+    if plot[2] == 1:
+        title_axis(a, options.title + 'Seek Count')
+    else:
+        title_axis(a, 'Seek Count')
+
+    a.set_ylabel('Seeks / sec')
+    if options.label:
+        a.legend(**legend_args)
+
+subplots_adjust(**adjust_kwargs)
+
+plot = should_graph(graphs, 'stats')
+if plot:
+    # create a table with a summary of all the
+    # results.
+
+    # we want to make sure we only print labels for the graphs
+    # that were done
+    check_labels = [ ['seek', 'Avg Seeks/s', False ], \
+                     ['tput', 'Avg MB/s', True ], \
+                     ['iops', 'Avg IO/s', True ] ]
+
+    # graph_stats has all the stats we decide to put in
+    # the table
+    graph_stats = stats
+
+    # graph labels are the column headers
+    graph_labels = []
+
+    # highlights is an array of true/false telling us
+    # which columns should have the max highlighted.  IF
+    # false we highlight the min instead
+    highlights = []
+
+    for i,x in enumerate(check_labels):
+        if should_graph(graphs, x[0]):
+            graph_labels.append(x[1])
+            highlights.append(x[2])
+        else:
+            # just put a None in that cell, we'll go back
+            # and delete all the Nones
+            for d in graph_stats:
+                d[i] = None
+            
+    # ugly trick so we can just delete the indexes from the
+    # stats row.  We do it in reverse order so the index
+    # number doesn't change as we work
+    for row in graph_stats:
+        for i in xrange(len(row) - 1, -1, -1):
+            if row[i] == None:
+                del row[i]
+
+    graph_labels.append('Run time (s)')
+    highlights.append(False)
+
+    table_labels = [ getlabel(x) for x in xrange(len(runs)) ]
+    a = subplot(*plot)
+    stats_plot = a
+    a.set_frame_on(False)
+    t = a.table(cellText=graph_stats, rowLabels=table_labels,
+            colLabels = graph_labels,
+            loc=(0.5, 0.99))
+
+    cells = t.get_celld()
+    format_table_cells(graph_stats, cells, len(runs), highlights)
+
+    if plot[2] == 1:
+        title_axis(a, options.title)
+    a.set_xticks([])
+    a.set_yticks([])
+
+cols = options.columns
+rows = (len(graphs) + cols - 1) / cols
+bottom_row = bottom_graph / cols
+
+# finally, some global bits for each subplot
+for x in xrange(1, bottom_graph + 1):
+    a = subplot(rows, cols, x)
+
+    this_row = (x - 1) / cols + 1
+    # turn off the xtick labels on the graphs above the bottom
+    if not options.interactive and this_row < bottom_row:
+        a.set_xticklabels([])
+    elif options.interactive:
+        a.set_xticks(xticks)
+        a.set_xticklabels(xticklabels)
+        a.set_xlabel('Time (seconds)')
+    else:
+        a.set_xlabel('Time (seconds)')
+
+    for t in a.yaxis.get_majorticklabels():
+        t.set_fontsize(8)
+
+    for t in a.xaxis.get_majorticklabels():
+        t.set_fontsize(8)
+
+    # create dashed lines for each ytick
+    ticks = a.get_yticks()
+    ymin, ymax = a.get_ylim()
+    for y in ticks[1:]:
+        try:
+            a.hlines(y, xmin, xmax, linestyle='dashed', alpha=0.5)
+        except:
+            a.hlines(y, xmin, xmax, alpha=0.5)
+    a.set_ylim(ymin, ymax)
+    # set the xlimits to something sane
+    a.set_xlim(xmin, xmax)
+
+if not options.interactive:
+    print "saving graph to %s" % options.output
+    savefig(options.output, dpi=options.dpi, orientation='landscape')
+
+show()
+
